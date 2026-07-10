@@ -1,0 +1,39 @@
+name: delivery gate
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write
+concurrency:
+  group: pages-deep
+  cancel-in-progress: false
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.dep.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage benign _site
+        run: |
+          mkdir -p _site
+          echo "delivery-gate-ok" > _site/index.html
+          ls -la _site
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Upload artifact
+        id: upl
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+          retention-days: 1
+      - name: Deploy
+        id: dep
+        uses: actions/deploy-pages@v4
+      - name: Record
+        if: always()
+        run: |
+          echo "url=${{ steps.dep.outputs.page_url }}" >> "$GITHUB_STEP_SUMMARY"

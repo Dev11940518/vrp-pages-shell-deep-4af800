@@ -1,0 +1,87 @@
+name: shell deep sweep
+on:
+  workflow_dispatch:
+    inputs:
+      canary_dns:
+        description: "canary DNS base (e.g. abc.oast.fun)"
+        required: true
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write
+concurrency:
+  group: pages-deep
+  cancel-in-progress: false
+jobs:
+  deploy-case:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.dep.outputs.page_url }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        case:
+          - T1_Q_SLEEP
+          - T2_SEMI_SLEEP
+          - T3_BACK_SLEEP
+          - T4_SUBST_SLEEP
+          - T5_PIPE_SLEEP
+          - T6_NL_SLEEP
+          - D1_Q_DNS
+          - D2_SUBST_DNS
+          - D3_CURL_DNS
+          - A1_DIR_Q_SLEEP
+          - C1_CTRL
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate probes
+        run: python3 probe/make_deep_probes.py "${{ inputs.canary_dns }}"
+      - name: Show generated members
+        run: |
+          ls -la probe/tarballs
+          python3 -c "import tarfile; tf=tarfile.open('probe/tarballs/${{ matrix.case }}.tar'); [print(repr(m.name),m.type,m.size) for m in tf]"
+      - name: Stage artifact.tar
+        run: |
+          mkdir -p _stage
+          cp "probe/tarballs/${{ matrix.case }}.tar" _stage/artifact.tar
+          ls -la _stage
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Delete prior github-pages artifact for this run
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: |
+          for id in $(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate -q '.artifacts[]|select(.name=="github-pages")|.id'); do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id" || true
+          done
+      - name: Upload artifact
+        id: upl
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-pages
+          path: _stage/artifact.tar
+          retention-days: 1
+          if-no-files-found: error
+      - name: Deploy
+        if: steps.upl.outcome == 'success'
+        id: dep
+        continue-on-error: true
+        uses: actions/deploy-pages@v4
+      - name: Record
+        if: always()
+        env:
+          CASE: "${{ matrix.case }}"
+          UPL:  "${{ steps.upl.outcome }}"
+          DEP:  "${{ steps.dep.outcome }}"
+          URL:  "${{ steps.dep.outputs.page_url }}"
+        run: |
+          {
+            echo "## $CASE"
+            echo "- upload: ${UPL:-skipped}"
+            echo "- deploy: ${DEP:-skipped}"
+            echo "- url: ${URL:-none}"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
